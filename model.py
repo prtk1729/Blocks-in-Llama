@@ -59,6 +59,16 @@ def precompute_m_theta_matrix(head_dim: int, seq_len: int, device: str, theta: f
 
 
 def rotary_positional_embeddings(x: torch.Tensor, polar_form_matrix: torch.Tensor, device = str):
+    '''
+    Recall:
+        - Here, we are getting the Embeddings after interacting with 
+        - Weight matrices
+        - And after splitting into heads
+
+    Hence, 
+    Shape of x: (B, seq_len, h, head_dim) i.e for Query -> h = n_q_heads, for Key -> h = n_kv_heads, 
+    NOTE: head_dim is same for both
+    '''
     # (B, seq_len, h, head_dim) -> (B, seq_len, h, head_dim/2)
     # 2 consecutive values will become single complex number
     # shape_tuple = *x.shape[:-1] # (B, seq_len, h)
@@ -96,7 +106,17 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.dim = args.dim
         self.n_q_heads = args.n_heads
-        self.n_kv_heads = args.n_kv_heads
+        self.device = args.device
+
+        # Either GQA or MHA
+        self.n_kv_heads = args.n_kv_heads if args.n_kv_heads != None else args.n_heads
+
+        self.head_dim = self.dim // self.n_q_heads
+        # Dimension of Key/Query/Value Heads are same i.e head_dim
+        # Recall width was same in Grouped Viz
+        # self.head_dim = self.q_dim = self.k_dim = self.v_dim 
+
+
 
         # Recall Multi-Query Attention:
         #    |     |     |    (n_v_heads)
@@ -107,7 +127,113 @@ class SelfAttention(nn.Module):
 
         # How many times we repeat each key-head, value-head?
         self.q_head_group_size = self.n_q_heads // self.n_kv_heads
-        
+
+
+        # Recall MH-A learnables
+        self.wq = nn.Linear(self.dim, self.n_q_heads * self.head_dim ,  bias = False)
+        # Projects from dim -> n_kv_heads * self.head_dim
+        self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim , bias = False)
+        self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim , bias = False)
+
+        # Recall: After concat all heads i.e n_heads * head_dim
+        self.wo = nn.Linear(self.n_q_heads * self.head_dim, self.dim, bias = False)
+
+
+        # Since, we will use this to store each head, i.e after splitting
+        cache_shape = (args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim)
+        # We create 2 separate caches for key and values, query? Simply last token in query
+        self.cache_k = torch.zeros(cache_shape)
+        self.cache_v = torch.zeros(cache_shape)
+
+
+    def n_repeats(self, x: torch.Tensor, n_repeats: int):
+        '''
+            If n_repeats == 1 => MH-A usual
+            Else: Grouped MH-A
+        '''
+        batch_size, seq_len, n_kv_heads, head_dim = x.shape 
+        if n_repeats == 1:
+            return x
+
+        # First we create a new dimension
+        x = x.expand(batch_size, seq_len, None, n_kv_heads, head_dim)
+        x = x.reshape()
+
+
+    def forward(self, x: torch.Tensor, 
+                start_pos: int, 
+                polar_form_matrix: torch.Tensor, 
+                ):
+        '''
+        Args:
+            - x: Embedded token. Where?
+            - start_pos: At position `start_pos` of the sequence
+            - polar_form_matrix: 
+                - This is non-learnable i.e deterministic
+                - Simply an outer_product of all pairs of < theta, m >
+
+            NOTE: The Seq_len == 1, here. Why?
+            During Inference, we pass the token as position "start_pos" only
+            Keys[0: start_pos), Values[0: start_pos]  are cached
+            We require these, due to causal mask property to predict the next token
+                - i.e, we need:-  
+                    Keys[ 0: start_pos ), Values[ 0: start_pos )  {Retrieve this from cache}
+                    Query[ start_pos ] {Apply RoPE and compute here}
+            Recall: 
+                - Viz, how we use these to predict the next token
+
+            We write this code for inference only.
+            We aren't training from scratch
+        '''
+        # Shape of x: (B, 1, dim) -> 1 Embedded token of dim = dim
+        batch_size, seq_len, dim = x.shape 
+        assert seq_len == 1, "During Inference, more than one token was passed"
+
+        # 1st step of MHA / Self-Attention recall figure
+        # (B, 1, dim) -> (B, 1, n_q_heads * head_dim )
+        xq = self.wq(x)
+
+        # (B, 1, dim) -> (B, 1, n_kv_heads * head_dim )
+        xk = self.wk(x)
+
+        # (B, 1, dim) -> (B, 1, n_kv_heads * head_dim )
+        xv = self.wv(x)
+
+        # Split them into heads
+        xq = xq.reshape(batch_size, seq_len, self.n_q_heads, self.head_dim)
+        xk = xk.reshape(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xv = xv.reshape(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+
+        # Recall self-attention mechanism in figure, but wait...
+        # Did we use the positional Encodings?
+
+        # Here, to each head we apply RoPE
+        # But, on only important ones i.e other than values
+        # (B, seq_len, n_q_heads, head_dim) -> (B, seq_len, n_q_heads, head_dim)
+        # Why? rotary positional Embeddings conserves the shape after operation.
+        xq = rotary_positional_embeddings(xq, polar_form_matrix, device = self.device)
+        # (B, seq_len, n_kv_heads, head_dim) -> (B, seq_len, n_kv_heads, head_dim)
+        xk = rotary_positional_embeddings(xk, polar_form_matrix, device = self.device)
+
+
+        ## SO, we currently have the next tokens embeddings for query and key
+        # Store them in cache for future predictions
+        seq_len = 1 # since 1 token at inference
+        self.cache_k[:batch_size, start_pos: start_pos+seq_len, :self.n_kv_heads, :self.head_dim] = xk
+        self.cache_v[:batch_size, start_pos: start_pos+seq_len, :self.n_kv_heads, :self.head_dim] = xv
+
+        # Now, we can get the required window in both key and value, for causal logic
+        # to predict the next token
+        # Recall ppt with growing K, V, But fixed 1 sequnce from Query
+        keys = self.cache_k[:batch_size, 0: start_pos+seq_len, :self.n_kv_heads, :self.head_dim]
+        values = self.cache_v[:batch_size, 0: start_pos+seq_len, :self.n_kv_heads, :self.head_dim]
+
+
+        ## Multi-Grouped-Query
+        ## Here, we have the required xv, xk, xq
+        keys = self.n_repeats(keys, self.q_head_group_size)
+        values = self.n_repeats(values, self.q_head_group_size)
+
 
 class RMSNorm(nn.Module):
     def __init__(self, args: ModelArgs):
