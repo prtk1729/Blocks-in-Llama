@@ -27,11 +27,11 @@ class ModelArgs:
     device: str = None # will be set when we know where we are running it on
 
 
+
 def precompute_m_theta_matrix(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
     # n_heads = args.n_heads # For the query, we have diff num of heads in Llama vs Vanilla Transf.
     # dim = args.dim
-
-    assert head_dim % 2 != 0, "dim of head for query should be even as pre the paper"
+    assert head_dim % 2 == 0, "dim of head for query should be even as pre the paper"
     # 1 / 10000 ** (2(i - 1)/q_dim ), i = [1, 2, ..., dim//2], q_dim = head_dim = dim / n_heads
     # (B, seq_len, h_q, head_dim_q)
     theta_numerator = torch.arange( 0, head_dim, 2 ).float() # same as above [0, 2, 4, ..., head_dim of these]
@@ -66,7 +66,7 @@ def rotary_positional_embeddings(x: torch.Tensor, polar_form_matrix: torch.Tenso
         - And after splitting into heads
 
     Hence, 
-    Shape of x: (B, seq_len, h, head_dim) i.e for Query -> h = n_q_heads, for Key -> h = n_kv_heads, 
+    Shape of x: (B, seq_len, h, head_dim) i.e for Query -> h = n_heads_q, for Key -> h = n_kv_heads, 
     NOTE: head_dim is same for both
     '''
     # (B, seq_len, h, head_dim) -> (B, seq_len, h, head_dim/2)
@@ -100,18 +100,45 @@ def rotary_positional_embeddings(x: torch.Tensor, polar_form_matrix: torch.Tenso
     return x_out.as_type(x).to(device)
 
 
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    '''
+        If n_rep == 1 => MH-A usual
+        Else: Grouped MH-A
+    '''
+    batch_size, seq_len, n_kv_heads, head_dim = x.shape 
+    if n_rep == 1:
+        return x
+
+    # First we create a new dimension. But where?
+    # (B, seq_len, n_kv_heads, head_dim ) -> (B, seq_len, n_kv_heads, n_rep, head_dim )
+    # Can be thought of, for each head_id -> make n_repeat copies of it.
+    # # (B, seq_len, n_kv_heads, head_dim) -> (B, seq_len, n_kv_heads, 1, head_dim)
+    # x = x[:, :, :, None, :]
+    # # (B, seq_len, n_kv_heads, 1, head_dim) -> (B, seq_len, n_kv_heads, n_rep, head_dim)
+    # x = x.expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
+    # # Merge for each head_id, so that dim for each head gets concat as n_rep * head_dim
+    # # (B, seq_len, n_kv_heads, n_rep * head_dim)
+    # x = x.reshape(batch_size, seq_len, n_kv_heads, n_rep * head_dim )
+    # return x
+
+    return (
+            x[:, :, :, None, :]
+            .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
+            .reshape(batch_size, seq_len, n_kv_heads, n_rep * head_dim)
+            )
+
 
 class SelfAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.dim = args.dim
-        self.n_q_heads = args.n_heads
-        self.device = args.device
+        
+        self.n_heads_q = args.n_heads
+        
 
         # Either GQA or MHA
         self.n_kv_heads = args.n_kv_heads if args.n_kv_heads != None else args.n_heads
 
-        self.head_dim = self.dim // self.n_q_heads
+        self.head_dim = args.dim // self.n_heads_q
         # Dimension of Key/Query/Value Heads are same i.e head_dim
         # Recall width was same in Grouped Viz
         # self.head_dim = self.q_dim = self.k_dim = self.v_dim 
@@ -123,56 +150,29 @@ class SelfAttention(nn.Module):
         #    
         #    |     |     |    (n_k_heads)
         #   / \   / \   / \ 
-        #  |   | |   | |   |  (n_q_heads)
+        #  |   | |   | |   |  (n_heads_q)
 
         # How many times we repeat each key-head, value-head?
-        self.q_head_group_size = self.n_q_heads // self.n_kv_heads
+        # self.q_head_group_size = self.n_rep
+        # print( "========> n_kv_heads", self.n_kv_heads )
+        self.n_rep = self.n_heads_q // self.n_kv_heads
 
 
         # Recall MH-A learnables
-        self.wq = nn.Linear(self.dim, self.n_q_heads * self.head_dim ,  bias = False)
+        self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim ,  bias = False)
         # Projects from dim -> n_kv_heads * self.head_dim
-        self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim , bias = False)
-        self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim , bias = False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim , bias = False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim , bias = False)
 
         # Recall: After concat all heads i.e n_heads * head_dim
-        self.wo = nn.Linear(self.n_q_heads * self.head_dim, self.dim, bias = False)
+        self.wo = nn.Linear(self.n_heads_q * self.head_dim, args.dim, bias = False)
 
 
         # Since, we will use this to store each head, i.e after splitting
-        cache_shape = (args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim)
+        # cache_shape = tuple([args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim])
         # We create 2 separate caches for key and values, query? Simply last token in query
-        self.cache_k = torch.zeros(cache_shape)
-        self.cache_v = torch.zeros(cache_shape)
-
-
-    def n_repeats(self, x: torch.Tensor, n_repeats: int):
-        '''
-            If n_repeats == 1 => MH-A usual
-            Else: Grouped MH-A
-        '''
-        batch_size, seq_len, n_kv_heads, head_dim = x.shape 
-        if n_repeats == 1:
-            return x
-
-        # First we create a new dimension. But where?
-        # (B, seq_len, n_kv_heads, head_dim ) -> (B, seq_len, n_kv_heads, n_repeats, head_dim )
-        # Can be thought of, for each head_id -> make n_repeat copies of it.
-        # # (B, seq_len, n_kv_heads, head_dim) -> (B, seq_len, n_kv_heads, 1, head_dim)
-        # x = x[:, :, :, None, :]
-        # # (B, seq_len, n_kv_heads, 1, head_dim) -> (B, seq_len, n_kv_heads, n_repeats, head_dim)
-        # x = x.expand(batch_size, seq_len, n_kv_heads, n_repeats, head_dim)
-        # # Merge for each head_id, so that dim for each head gets concat as n_repeats * head_dim
-        # # (B, seq_len, n_kv_heads, n_repeats * head_dim)
-        # x = x.reshape(batch_size, seq_len, n_kv_heads, n_repeats * head_dim )
-        # return x
-
-        return (
-                x[:, :, :, None, :]
-                .expand(batch_size, seq_len, n_kv_heads, n_repeats, head_dim)
-                .reshape(batch_size, seq_len, n_kv_heads, n_repeats * head_dim)
-               )
-
+        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim))
 
     def forward(self, x: torch.Tensor, 
                 start_pos: int, 
@@ -204,7 +204,7 @@ class SelfAttention(nn.Module):
         assert seq_len == 1, "During Inference, more than one token was passed"
 
         # 1st step of MHA / Self-Attention recall figure
-        # (B, 1, dim) -> (B, 1, n_q_heads * head_dim )
+        # (B, 1, dim) -> (B, 1, n_heads_q * head_dim )
         xq = self.wq(x)
 
         # (B, 1, dim) -> (B, 1, n_kv_heads * head_dim )
@@ -214,7 +214,7 @@ class SelfAttention(nn.Module):
         xv = self.wv(x)
 
         # Split them into heads
-        xq = xq.reshape(batch_size, seq_len, self.n_q_heads, self.head_dim)
+        xq = xq.reshape(batch_size, seq_len, self.n_heads_q, self.head_dim)
         xk = xk.reshape(batch_size, seq_len, self.n_kv_heads, self.head_dim)
         xv = xv.reshape(batch_size, seq_len, self.n_kv_heads, self.head_dim)
 
@@ -223,11 +223,11 @@ class SelfAttention(nn.Module):
 
         # Here, to each head we apply RoPE
         # But, on only important ones i.e other than values
-        # (B, seq_len, n_q_heads, head_dim) -> (B, seq_len, n_q_heads, head_dim)
+        # (B, seq_len, n_heads_q, head_dim) -> (B, seq_len, n_heads_q, head_dim)
         # Why? rotary positional Embeddings conserves the shape after operation.
-        xq = rotary_positional_embeddings(xq, polar_form_matrix, device = self.device)
+        xq = rotary_positional_embeddings(xq, polar_form_matrix, device = x.device)
         # (B, seq_len, n_kv_heads, head_dim) -> (B, seq_len, n_kv_heads, head_dim)
-        xk = rotary_positional_embeddings(xk, polar_form_matrix, device = self.device)
+        xk = rotary_positional_embeddings(xk, polar_form_matrix, device = x.device)
 
 
         ## SO, we currently have the next tokens embeddings for query and key
@@ -245,8 +245,8 @@ class SelfAttention(nn.Module):
 
         ## Multi-Grouped-Query
         ## Here, we have the required xv, xk, xq
-        keys = self.n_repeats(keys, self.q_head_group_size)
-        values = self.n_repeats(values, self.q_head_group_size)
+        keys = repeat_kv(keys, self.n_rep)
+        values = repeat_kv(values, self.n_rep)
 
         # MH-A as usual
         # (B, 1, H_Q, Head_Dim) -> (B, H_Q, 1, Head_Dim)
@@ -276,28 +276,28 @@ class FeedForward(nn.Module):
         # the weight matrices project the x's dimension to (i.e from dim -> hidden_dim)
 
         # Calculate hdden_dim
-        self.dim = args.dim
-        self.hidden_dim = 4 * self.dim
-        self.hidden_dim = int((2 * self.hidden_dim) / 3)
+        
+        hidden_dim = 4 * args.dim
+        hidden_dim = int((2 * hidden_dim) / 3)
 
         if args.ffn_dim_multiplier is not None:
-            self.hidden_dim *= args.ffn_dim_multiplier
+            hidden_dim *= args.ffn_dim_multiplier
         
         # Here, it needn't be a multiple of param "multiple_of"
         # But, we want to make the next multiple of "multiple_of"
         # recall: ceil(a, b) = (a + b - 1)/b
         # We want to ask what's the next multiple of "multiple_of"
-        remainder, quotient = (self.hidden_dim % args.multiple_of), (self.hidden_dim // args.multiple_of)
+        remainder, quotient = (hidden_dim % args.multiple_of), (hidden_dim // args.multiple_of)
         if remainder > 0:
-            self.hidden_dim = (quotient * args.multiple_of) + args.multiple_of # crosses hidden_dim
+            hidden_dim = (quotient * args.multiple_of) + args.multiple_of # crosses hidden_dim
 
         # recall    W*x, V*x -> swish(W*x)
         # W*x: Projection from dim -> hidden_dim 
-        self.w1 = nn.Linear(self.dim, self.hidden_dim) 
+        self.w1 = nn.Linear(args.dim, hidden_dim, bias = False) 
         # V*x: Projection from dim -> hidden_dim 
-        self.w3 = nn.Linear(self.dim, self.hidden_dim)
+        self.w3 = nn.Linear(args.dim, hidden_dim, bias = False)
         # W2*x: Projection from hidden_dim -> dim
-        self.w2 = nn.Linear(self.hidden_dim, self.dim)
+        self.w2 = nn.Linear(hidden_dim, args.dim, bias = False)
 
     def forward(self, x: torch.Tensor): 
         # (B, seq_len, dim) -> (B, seq_len, hidden_dim)
@@ -318,10 +318,10 @@ class FeedForward(nn.Module):
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.norm_eps = eps
-        self.dim = dim
+        self.eps = eps
         # init gamma learnables(nn.Parameter) which are scaling invar
-        self.gamma = nn.Parameter(torch.ones(self.dim)) # assoc with each feat
+        # self.gamma renamed as self.weight, when loading weights? 
+        self.weight = nn.Parameter(torch.ones(dim)) # assoc with each feat
 
     def _norm(self, x: torch.Tensor):
         '''
@@ -333,13 +333,13 @@ class RMSNorm(nn.Module):
         # torch.rsqrt(x) = 1 / sqrt(x)
         x = x.pow(2)
         x = x.mean(dim=-1, keepdim=True) # Want: B=1, seq_len=1, [[[ 1 2 3 4 ... 2048 ]]] => [[[ Avg. ]]]
-        x = x + self.norm_eps # broadcast to avoid div by 0
+        x = x + self.eps # broadcast to avoid div by 0
         # (B, seq_len, dim) * (B, seq_len, 1) -> (B, seq_len, dim)
         return x * torch.rsqrt(x)
 
     def forward(self, x: torch.Tensor):
         # (dim) * (B, seq_len, dim) -> (B, seq_len, dim)
-        return self.gamma * self._norm(x.float()).type_as(x)
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
 
@@ -348,11 +348,11 @@ class EncoderBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
-        self.eps = args.norm_eps
+        
 
-        self.attention_norm = RMSNorm(self.dim, self.eps)
+        self.attention_norm = RMSNorm(self.dim, args.norm_eps)
         self.attention = SelfAttention(args)
-        self.ffn_norm = RMSNorm(self.dim, self.eps)
+        self.ffn_norm = RMSNorm(self.dim, args.norm_eps)
         self.feed_forward = FeedForward(args)
 
     def forward(self, \
@@ -384,9 +384,9 @@ class Transformer(nn.Module):
         self.dim = args.dim
         self.n_layers = args.n_layers
         self.vocab_size = args.vocab_size
-        self.eps = args.eps
+        self.norm_eps = args.norm_eps
 
-        self.tok_emb = nn.Embedding(self.vocab_size, self.dim) # for each token in vocab -> dim sized
+        self.tok_embeddings = nn.Embedding(self.vocab_size, self.dim) # for each token in vocab -> dim sized
 
         # Nx of these Encoder Blocks, here 32 repeats in Llama
         # Recall dotted part
@@ -395,9 +395,9 @@ class Transformer(nn.Module):
             self.layers.append( EncoderBlock(self.args) )
 
         # RMSNorm
-        self.norm = RMSNorm(self.dim, self.eps)
+        self.norm = RMSNorm(self.dim, self.norm_eps)
         # Linear Layer i.e projection to output
-        self.output = nn.Linear(args.dim, args.vocab_size)
+        self.output = nn.Linear(args.dim, args.vocab_size, bias = False)
 
         # Precompute just the m_theta matrix
         # Each element is m_i * theta_j
@@ -419,7 +419,7 @@ class Transformer(nn.Module):
         assert seq_len == 1, "1 Token at a time, Hence, seq_len needs to be 1, We aren't training, rather simply inference this"
 
         # (B, seq_len)
-        x = self.tok_emb(tokens)
+        x = self.tok_embeddings(tokens)
         
         # These token Embeddings are simply sent to layers i.e N EncoderBlocks
         # Since, the dim is fixed for a particular variant i.e Here in 7b model, it is 4096

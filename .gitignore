@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+####### Downlooaded Llama tokenizer #######
+tokenizer.model
+#######################
+
 ########## DIR ###########
 llama2-7b
 ##########################
