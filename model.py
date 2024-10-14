@@ -316,11 +316,12 @@ class FeedForward(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.norm_eps = args.norm_eps
+        self.norm_eps = eps
+        self.dim = dim
         # init gamma learnables(nn.Parameter) which are scaling invar
-        self.gamma = nn.Parameter(torch.ones(args.dim)) # assoc with each feat
+        self.gamma = nn.Parameter(torch.ones(self.dim)) # assoc with each feat
 
     def _norm(self, x: torch.Tensor):
         '''
@@ -344,8 +345,31 @@ class RMSNorm(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    pass
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        self.eps = args.norm_eps
 
+        self.attention_norm = RMSNorm(self.dim, self.eps)
+        self.attention = SelfAttention(args)
+        self.ffn_norm = RMSNorm(self.dim, self.eps)
+        self.feed_forward = FeedForward(args)
+
+    def forward(self, \
+                x: torch.Tensor,
+                polar_form_matrix: torch.Tensor, 
+                start_pos: int):
+        # (B, seq_len, dim) -> (B, seq_len, dim)
+        # x_normalised = self.attention_norm.forward(x) # don't make a new copy as we won't use x_norm later
+        
+        x_cat = x + self.attention.forward( 
+                                   self.attention_norm.forward(x), \
+                                   start_pos, 
+                                   polar_form_matrix
+                                   )
+        x = self.ffn_norm(x_cat)
+        x = x_cat + self.feed_forward.forward(x)
+        return x
 
 class Transformer(nn.Module):
     '''
@@ -371,9 +395,9 @@ class Transformer(nn.Module):
             self.layers.append( EncoderBlock(self.args) )
 
         # RMSNorm
-        self.norm = RMSNorm(args)
+        self.norm = RMSNorm(self.dim, self.eps)
         # Linear Layer i.e projection to output
-        self.output = nn.LinearLayer(args.dim, args.vocab_size)
+        self.output = nn.Linear(args.dim, args.vocab_size)
 
         # Precompute just the m_theta matrix
         # Each element is m_i * theta_j
@@ -389,8 +413,27 @@ class Transformer(nn.Module):
                                                 )
 
 
-    def forward(self, x):
-        # x here can have multiple heads
-        # (B, seq_len, h, q_dim)
+    def forward(self, tokens: torch.Tensor, start_pos: int):
+        batch_size, seq_len = tokens.shape
 
+        assert seq_len == 1, "1 Token at a time, Hence, seq_len needs to be 1, We aren't training, rather simply inference this"
+
+        # (B, seq_len)
+        x = self.tok_emb(tokens)
         
+        # These token Embeddings are simply sent to layers i.e N EncoderBlocks
+        # Since, the dim is fixed for a particular variant i.e Here in 7b model, it is 4096
+        # Only thing changes is seq_len: context-window, we are interested in a givenm slice only
+        freqs_complex = self.m_theta[start_pos: start_pos+seq_len] # for now, single token imagine
+
+        # Apply for the N_layers
+        for layer in self.layers:
+            x = layer(x, freqs_complex, start_pos)
+
+
+        # out of the n layers i.e dotted part in fig
+        x = self.norm(x)
+
+        # Project inorder to apply softmax and get best predicted token
+        out = self.output(x).float()
+        return out
