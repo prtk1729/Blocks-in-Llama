@@ -155,9 +155,23 @@ class SelfAttention(nn.Module):
         if n_repeats == 1:
             return x
 
-        # First we create a new dimension
-        x = x.expand(batch_size, seq_len, None, n_kv_heads, head_dim)
-        x = x.reshape()
+        # First we create a new dimension. But where?
+        # (B, seq_len, n_kv_heads, head_dim ) -> (B, seq_len, n_kv_heads, n_repeats, head_dim )
+        # Can be thought of, for each head_id -> make n_repeat copies of it.
+        # # (B, seq_len, n_kv_heads, head_dim) -> (B, seq_len, n_kv_heads, 1, head_dim)
+        # x = x[:, :, :, None, :]
+        # # (B, seq_len, n_kv_heads, 1, head_dim) -> (B, seq_len, n_kv_heads, n_repeats, head_dim)
+        # x = x.expand(batch_size, seq_len, n_kv_heads, n_repeats, head_dim)
+        # # Merge for each head_id, so that dim for each head gets concat as n_repeats * head_dim
+        # # (B, seq_len, n_kv_heads, n_repeats * head_dim)
+        # x = x.reshape(batch_size, seq_len, n_kv_heads, n_repeats * head_dim )
+        # return x
+
+        return (
+                x[:, :, :, None, :]
+                .expand(batch_size, seq_len, n_kv_heads, n_repeats, head_dim)
+                .reshape(batch_size, seq_len, n_kv_heads, n_repeats * head_dim)
+               )
 
 
     def forward(self, x: torch.Tensor, 
@@ -233,6 +247,28 @@ class SelfAttention(nn.Module):
         ## Here, we have the required xv, xk, xq
         keys = self.n_repeats(keys, self.q_head_group_size)
         values = self.n_repeats(values, self.q_head_group_size)
+
+        # MH-A as usual
+        # (B, 1, H_Q, Head_Dim) -> (B, H_Q, 1, Head_Dim)
+        xq = xq.transpose(1, 2)
+        # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
+        keys = keys.transpose(1, 2)
+        # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
+        values = values.transpose(1, 2)
+
+        # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / torch.sqrt(self.head_dim)
+        # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        # (B, H_Q, 1, Seq_Len) @ (B, H_Q, Seq_Len_KV, Head_Dim) -> (B, H_Q, 1, Head_Dim)
+        output = torch.matmul(scores, values)
+        # (B, H_Q, 1, Head_Dim) -> (B, 1, H_Q, Head_Dim) -> (B, 1, Dim)
+        output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
+        return self.wo(output) # (B, 1, Dim) -> (B, 1, Dim)
+
+
+
 
 
 class RMSNorm(nn.Module):
