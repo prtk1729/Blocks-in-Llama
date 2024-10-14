@@ -268,6 +268,50 @@ class SelfAttention(nn.Module):
         return self.wo(output) # (B, 1, Dim) -> (B, 1, Dim)
 
 
+class FeedForward(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        # The hidden dim is basically the dim, 
+        # the weight matrices project the x's dimension to (i.e from dim -> hidden_dim)
+
+        # Calculate hdden_dim
+        self.dim = args.dim
+        self.hidden_dim = 4 * self.dim
+        self.hidden_dim = int((2 * self.hidden_dim) / 3)
+
+        if args.ffn_dim_multiplier is not None:
+            self.hidden_dim *= args.ffn_dim_multiplier
+        
+        # Here, it needn't be a multiple of param "multiple_of"
+        # But, we want to make the next multiple of "multiple_of"
+        # recall: ceil(a, b) = (a + b - 1)/b
+        # We want to ask what's the next multiple of "multiple_of"
+        remainder, quotient = (self.hidden_dim % args.multiple_of), (self.hidden_dim // args.multiple_of)
+        if remainder > 0:
+            self.hidden_dim = (quotient * args.multiple_of) + args.multiple_of # crosses hidden_dim
+
+        # recall    W*x, V*x -> swish(W*x)
+        # W*x: Projection from dim -> hidden_dim 
+        self.w1 = nn.Linear(self.dim, self.hidden_dim) 
+        # V*x: Projection from dim -> hidden_dim 
+        self.w3 = nn.Linear(self.dim, self.hidden_dim)
+        # W2*x: Projection from hidden_dim -> dim
+        self.w2 = nn.Linear(self.hidden_dim, self.dim)
+
+    def forward(self, x: torch.Tensor): 
+        # (B, seq_len, dim) -> (B, seq_len, hidden_dim)
+        x_V = self.w3(x)
+
+        # (B, seq_len, dim) -> (B, seq_len, hidden_dim)
+        x = self.w1(x)
+        # (B, seq_len, dim) -> (B, seq_len, hidden_dim)
+        x = F.silu(x) # swish(x) = x * sigmoid(beta*x)
+
+        # (B, seq_len, hidden_dim) * (B, seq_len, hidden_dim) -> element-wise multi
+        x = x * x_V
+        return self.w2(x)
+
 
 
 
@@ -298,6 +342,9 @@ class RMSNorm(nn.Module):
 
 
 
+
+class EncoderBlock(nn.Module):
+    pass
 
 
 class Transformer(nn.Module):
