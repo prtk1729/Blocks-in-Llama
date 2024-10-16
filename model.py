@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import math
 from dataclasses import dataclass
 
 from typing import Optional
@@ -76,7 +76,7 @@ def rotary_positional_embeddings(x: torch.Tensor, polar_form_matrix: torch.Tenso
 
     # Recall fig 1: (x1, x2) -> (x1 + x2j)
     # x_complex's shape = (B, seq_len, h, head_dim) -> (B, seq_len, h, head_dim/2)
-    x_complex = torch.view_as_complex( torch.reshape( *x.shape[:-1] ), -1, 2 )
+    x_complex = torch.view_as_complex( x.float().reshape( *x.shape[:-1] , -1, 2) )
     
     # But, polar_form_matrix has different shape
     # Shape of x_complex: (B, seq_len, h, dim/2)
@@ -97,7 +97,7 @@ def rotary_positional_embeddings(x: torch.Tensor, polar_form_matrix: torch.Tenso
     x_out = x_out.reshape( *x.shape )
 
     # typecast and move to device
-    return x_out.as_type(x).to(device)
+    return x_out.type_as(x).to(device)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -171,8 +171,8 @@ class SelfAttention(nn.Module):
         # Since, we will use this to store each head, i.e after splitting
         # cache_shape = tuple([args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim])
         # We create 2 separate caches for key and values, query? Simply last token in query
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim), device = args.device)
+        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, args.n_kv_heads, self.head_dim), device = args.device)
 
     def forward(self, x: torch.Tensor, 
                 start_pos: int, 
@@ -203,6 +203,7 @@ class SelfAttention(nn.Module):
         batch_size, seq_len, dim = x.shape 
         assert seq_len == 1, "During Inference, more than one token was passed"
 
+
         # 1st step of MHA / Self-Attention recall figure
         # (B, 1, dim) -> (B, 1, n_heads_q * head_dim )
         xq = self.wq(x)
@@ -212,6 +213,7 @@ class SelfAttention(nn.Module):
 
         # (B, 1, dim) -> (B, 1, n_kv_heads * head_dim )
         xv = self.wv(x)
+
 
         # Split them into heads
         xq = xq.reshape(batch_size, seq_len, self.n_heads_q, self.head_dim)
@@ -256,8 +258,9 @@ class SelfAttention(nn.Module):
         # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
         values = values.transpose(1, 2)
 
+
         # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / torch.sqrt(self.head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
@@ -437,3 +440,9 @@ class Transformer(nn.Module):
         # Project inorder to apply softmax and get best predicted token
         out = self.output(x).float()
         return out
+
+
+
+
+
+
