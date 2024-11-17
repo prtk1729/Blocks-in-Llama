@@ -11,7 +11,7 @@ Exploring all the blocks (legos) to build the Llama model. Both coding + concept
 - SwiGLU Activation Function
 
 ### Architecture
-- [Llama.drawio.pdf](design_docs/Llama.drawio.pdf)
+- ![Alt text](./design_docs/Llama.png)
 
 ### Steps to download the model checkpoint
 - [Place Request to download the model](https://www.llama.com/llama-downloads/)
