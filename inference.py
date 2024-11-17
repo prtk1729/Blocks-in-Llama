@@ -276,7 +276,7 @@ class LLaMa:
 if __name__ == "__main__":
     torch.manual_seed(0)
 
-    allow_cuda = False # set when we want to use the available gpu
+    allow_cuda = True # set when we want to use the available gpu
     device = "cuda:0" if torch.cuda.is_available() and allow_cuda else "cpu"
 
     torch.cuda.empty_cache()
