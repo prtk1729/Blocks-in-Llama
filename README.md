@@ -1,5 +1,5 @@
 # Blocks-in-Llama
-Exploring all the blocks(legos) to build the Llama model. Both coding + conceptual understanding. Part of a course taken during IIITH days
+Exploring all the blocks (legos) to build the Llama model. Both coding + conceptual understanding. Part of a course taken during IIITH days.
 
 ## Topics documented
 - Architectural Difference between Vanilla Transformers and Llama
@@ -10,6 +10,8 @@ Exploring all the blocks(legos) to build the Llama model. Both coding + conceptu
 - Grouped Multi-Query Attention
 - SwiGLU Activation Function
 
+### Architecture
+- [Llama.drawio.pdf](design_docs/Llama.drawio.pdf)
 
 ### Steps to download the model checkpoint
 - [Place Request to download the model](https://www.llama.com/llama-downloads/)
@@ -25,4 +27,3 @@ Exploring all the blocks(legos) to build the Llama model. Both coding + conceptu
         - `Llama-2-7b` is model-id for 7 billion params model
         - `Llama-2-13b` is model-id for 13 billion params model
 - When prompted with the signed URL, use the one received on the mail.
-
